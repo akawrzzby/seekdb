@@ -16,6 +16,12 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "config_bridge.h"
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <strings.h>
+#include <glob.h>
+#include <sys/stat.h>
 #include "ob_dml_resolver.h"
 #include "sql/resolver/dml/ob_view_table_resolver.h"
 #include "sql/optimizer/ob_optimizer_util.h"
@@ -2709,6 +2715,13 @@ int ObDMLResolver::resolve_table(const ParseNode &parse_tree,
         if (OB_ISNULL(session_info_)) {
           ret = OB_INVALID_ARGUMENT;
         } else if (OB_FAIL(resolve_unnest_item(*table_node, table_item))) {
+        }
+        break;
+      }
+      case T_FILE_TABLE_EXPRESSION: {
+        if (OB_ISNULL(session_info_)) {
+          ret = OB_INVALID_ARGUMENT;
+        } else if (OB_FAIL(resolve_file_table_item(*table_node, table_item))) {
         }
         break;
       }
@@ -12820,6 +12833,1278 @@ int ObDMLResolver::check_need_fill_embedded_vec_expr_param(const ObDMLStmt &stmt
       }
     }
   }
+  return ret;
+}
+
+//==================== file as table: read_csv / read_json / read_parquet / glob ====================
+namespace {
+
+enum FtColType { FT_TYPE_INT = 0, FT_TYPE_DOUBLE, FT_TYPE_BOOL, FT_TYPE_DATE, FT_TYPE_DATETIME, FT_TYPE_VARCHAR };
+
+static int ft_read_file(common::ObIAllocator &alloc, const char *path, common::ObString &content)
+{
+  int ret = OB_SUCCESS;
+  FILE *fp = ::fopen(path, "rb");
+  if (NULL == fp) {
+    ret = OB_FILE_NOT_EXIST;
+  } else {
+    long sz = 0;
+    if (0 != ::fseek(fp, 0, SEEK_END) || (sz = ::ftell(fp)) < 0 || 0 != ::fseek(fp, 0, SEEK_SET)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      char *buf = static_cast<char *>(alloc.alloc(sz + 1));
+      if (OB_ISNULL(buf)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else {
+        size_t rd = ::fread(buf, 1, static_cast<size_t>(sz), fp);
+        buf[rd] = '\0';
+        content.assign_ptr(buf, static_cast<int32_t>(rd));
+      }
+    }
+    ::fclose(fp);
+  }
+  return ret;
+}
+
+static bool ft_parse_int(const common::ObString &s, int64_t &v)
+{
+  bool ok = false;
+  if (!s.empty() && s.length() < 64) {
+    char buf[64];
+    MEMCPY(buf, s.ptr(), s.length());
+    buf[s.length()] = '\0';
+    char *end = NULL;
+    long long x = ::strtoll(buf, &end, 10);
+    if (NULL != end && '\0' == *end) { v = static_cast<int64_t>(x); ok = true; }
+  }
+  return ok;
+}
+
+static bool ft_parse_double(const common::ObString &s, double &v)
+{
+  bool ok = false;
+  if (!s.empty() && s.length() < 64) {
+    char buf[64];
+    MEMCPY(buf, s.ptr(), s.length());
+    buf[s.length()] = '\0';
+    char *end = NULL;
+    double x = ::strtod(buf, &end);
+    if (NULL != end && '\0' == *end && end != buf) { v = x; ok = true; }
+  }
+  return ok;
+}
+
+static bool ft_parse_bool(const common::ObString &s, bool &v)
+{
+  bool ok = false;
+  if (4 == s.length() && 0 == ::strncasecmp(s.ptr(), "true", 4)) { v = true; ok = true; }
+  else if (5 == s.length() && 0 == ::strncasecmp(s.ptr(), "false", 5)) { v = false; ok = true; }
+  return ok;
+}
+
+static int64_t ft_days_from_civil(int64_t y, int64_t m, int64_t d)
+{
+  y -= m <= 2;
+  const int64_t era = (y >= 0 ? y : y - 399) / 400;
+  const int64_t yoe = y - era * 400;
+  const int64_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  const int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + doe - 719468;
+}
+
+static bool ft_parse_date(const common::ObString &s, int32_t &days)
+{
+  bool ok = false;
+  if (10 == s.length()) {
+    char buf[16];
+    MEMCPY(buf, s.ptr(), 10);
+    buf[10] = '\0';
+    int y = 0, m = 0, d = 0;
+    if (3 == ::sscanf(buf, "%4d-%2d-%2d", &y, &m, &d) && m >= 1 && m <= 12 && d >= 1 && d <= 31) {
+      days = static_cast<int32_t>(ft_days_from_civil(y, m, d));
+      ok = true;
+    }
+  }
+  return ok;
+}
+
+static bool ft_parse_datetime(const common::ObString &s, int64_t &usec)
+{
+  bool ok = false;
+  const int64_t len = s.length();
+  if (len >= 19 && len < 32) {
+    char buf[32];
+    MEMCPY(buf, s.ptr(), len);
+    buf[len] = '\0';
+    int y = 0, mo = 0, d = 0, h = 0, mi = 0, se = 0;
+    char sep = 0;
+    if (7 == ::sscanf(buf, "%4d-%2d-%2d%c%2d:%2d:%2d", &y, &mo, &d, &sep, &h, &mi, &se)
+        && (' ' == sep || 'T' == sep) && mo >= 1 && mo <= 12 && d >= 1 && d <= 31
+        && h >= 0 && h <= 23 && mi >= 0 && mi <= 59 && se >= 0 && se <= 59) {
+      usec = ((ft_days_from_civil(y, mo, d) * 24 + h) * 3600 + mi * 60 + se) * 1000000LL;
+      ok = true;
+    }
+  }
+  return ok;
+}
+
+static int ft_split_csv(common::ObIAllocator &alloc, const common::ObString &content,
+                        ObIArray<common::ObString> &cells, int64_t &col_cnt, int64_t &row_cnt)
+{
+  int ret = OB_SUCCESS;
+  const char *p = content.ptr();
+  const int64_t n = content.length();
+  int64_t i = 0;
+  int64_t cur_cols = 0;
+  col_cnt = 0;
+  row_cnt = 0;
+  while (OB_SUCC(ret) && i < n) {
+    char *buf = static_cast<char *>(alloc.alloc(n + 1));
+    if (OB_ISNULL(buf)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      break;
+    }
+    int64_t blen = 0;
+    if ('"' == p[i]) {
+      ++i;
+      while (i < n) {
+        if ('"' == p[i]) {
+          if (i + 1 < n && '"' == p[i + 1]) { buf[blen++] = '"'; i += 2; }
+          else { ++i; break; }
+        } else {
+          buf[blen++] = p[i++];
+        }
+      }
+      while (i < n && ',' != p[i] && '\n' != p[i]) { ++i; }
+    } else {
+      while (i < n && ',' != p[i] && '\n' != p[i]) { buf[blen++] = p[i++]; }
+      while (blen > 0 && '\r' == buf[blen - 1]) { --blen; }
+    }
+    ObString cell(static_cast<int32_t>(blen), buf);
+    if (OB_FAIL(cells.push_back(cell))) {
+    } else {
+      ++cur_cols;
+      if (i < n && ',' == p[i]) {
+        ++i;
+        continue;
+      }
+      if (i < n && '\n' == p[i]) { ++i; }
+      if (0 == row_cnt) { col_cnt = cur_cols; }
+      ++row_cnt;
+      cur_cols = 0;
+    }
+  }
+  if (OB_SUCC(ret) && cur_cols > 0) {
+    if (0 == row_cnt) { col_cnt = cur_cols; }
+    ++row_cnt;
+  }
+  return ret;
+}
+
+static int ft_glob_files(common::ObIAllocator &alloc, const common::ObString &pattern,
+                         ObIArray<common::ObString> &files)
+{
+  int ret = OB_SUCCESS;
+  char *pat = static_cast<char *>(alloc.alloc(pattern.length() + 1));
+  if (OB_ISNULL(pat)) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else {
+    MEMCPY(pat, pattern.ptr(), pattern.length());
+    pat[pattern.length()] = '\0';
+    glob_t g;
+    MEMSET(&g, 0, sizeof(g));
+    int grc = ::glob(pat, GLOB_NOSORT, NULL, &g);
+    if (0 != grc && GLOB_NOMATCH != grc) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (0 == grc) {
+      for (size_t k = 0; OB_SUCC(ret) && k < g.gl_pathc; ++k) {
+        struct stat st;
+        if (0 == ::stat(g.gl_pathv[k], &st) && S_ISREG(st.st_mode)) {
+          const int64_t plen = static_cast<int64_t>(::strlen(g.gl_pathv[k]));
+          char *copy = static_cast<char *>(alloc.alloc(plen + 1));
+          if (OB_ISNULL(copy)) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+          } else {
+            MEMCPY(copy, g.gl_pathv[k], plen + 1);
+            if (OB_FAIL(files.push_back(ObString(static_cast<int32_t>(plen), copy)))) {
+            }
+          }
+        }
+      }
+    }
+    ::globfree(&g);
+  }
+  return ret;
+}
+
+}  // namespace
+
+namespace {
+
+static int ft_json_unescape(common::ObIAllocator &alloc, const char *p, int64_t len, common::ObString &out)
+{
+  int ret = OB_SUCCESS;
+  char *buf = static_cast<char *>(alloc.alloc(len + 1));
+  if (OB_ISNULL(buf)) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else {
+    int64_t blen = 0;
+    for (int64_t i = 0; i < len; ++i) {
+      if ('\\' == p[i] && i + 1 < len) {
+        char c = p[++i];
+        switch (c) {
+          case 'n': buf[blen++] = '\n'; break;
+          case 't': buf[blen++] = '\t'; break;
+          case 'r': buf[blen++] = '\r'; break;
+          case 'b': buf[blen++] = '\b'; break;
+          case 'f': buf[blen++] = '\f'; break;
+          case 'u': {
+            if (i + 4 < len) {
+              i += 4;
+              buf[blen++] = '?';
+            }
+            break;
+          }
+          default: buf[blen++] = c; break;
+        }
+      } else {
+        buf[blen++] = p[i];
+      }
+    }
+    out.assign_ptr(buf, static_cast<int32_t>(blen));
+  }
+  return ret;
+}
+
+static int ft_parse_json_line(common::ObIAllocator &alloc, const char *p, int64_t n,
+                              ObIArray<common::ObString> &keys, ObIArray<common::ObString> &vals)
+{
+  int ret = OB_SUCCESS;
+  int64_t i = 0;
+  auto skip_space = [&]() { while (i < n && (' ' == p[i] || '\t' == p[i] || '\r' == p[i])) { ++i; } };
+  skip_space();
+  if (i >= n || '{' != p[i]) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    ++i;
+    while (OB_SUCC(ret)) {
+      skip_space();
+      if (i < n && '}' == p[i]) { ++i; break; }
+      if (i < n && ',' == p[i]) { ++i; continue; }
+      if (i >= n || '"' != p[i]) { ret = OB_ERR_UNEXPECTED; break; }
+      ++i;
+      int64_t kstart = i;
+      while (i < n && '"' != p[i]) { if ('\\' == p[i]) { ++i; } ++i; }
+      if (i >= n) { ret = OB_ERR_UNEXPECTED; break; }
+      ObString key;
+      if (OB_FAIL(ft_json_unescape(alloc, p + kstart, i - kstart, key))) { break; }
+      ++i;
+      skip_space();
+      if (i >= n || ':' != p[i]) { ret = OB_ERR_UNEXPECTED; break; }
+      ++i;
+      skip_space();
+      ObString val;
+      bool is_null = false;
+      if (i < n && '"' == p[i]) {
+        ++i;
+        int64_t vstart = i;
+        while (i < n && '"' != p[i]) { if ('\\' == p[i]) { ++i; } ++i; }
+        if (i >= n) { ret = OB_ERR_UNEXPECTED; break; }
+        if (OB_FAIL(ft_json_unescape(alloc, p + vstart, i - vstart, val))) { break; }
+        ++i;
+      } else {
+        int64_t vstart = i;
+        while (i < n && ',' != p[i] && '}' != p[i]) { ++i; }
+        int64_t vend = i;
+        while (vend > vstart && (' ' == p[vend - 1] || '\t' == p[vend - 1] || '\r' == p[vend - 1])) { --vend; }
+        if (4 == vend - vstart && 0 == ::strncmp(p + vstart, "null", 4)) {
+          is_null = true;
+        } else {
+          val.assign_ptr(p + vstart, static_cast<int32_t>(vend - vstart));
+        }
+      }
+      if (OB_FAIL(ret)) { break; }
+      if (is_null) { val.reset(); }
+      if (OB_FAIL(keys.push_back(key))) { break; }
+      if (OB_FAIL(vals.push_back(val))) { break; }
+    }
+  }
+  return ret;
+}
+
+}  // namespace
+
+static int ft_get_const_obj(const ParseNode *node, const ParamStore *ps, ObObj &out)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(node)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (T_QUESTIONMARK == node->type_) {
+    if (OB_ISNULL(ps) || node->value_ < 0 || node->value_ >= ps->count()) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      out = ps->at(node->value_);
+      LOG_INFO("ft const obj", "idx", node->value_, "type", out.get_type(),
+               "is_num", out.is_numeric_type(), "is_null", out.is_null());
+    }
+  } else if (T_VARCHAR == node->type_ || T_CHAR == node->type_) {
+    out.set_varchar(ObString(node->str_len_, node->str_value_));
+  } else if (T_INT == node->type_) {
+    out.set_int(static_cast<int64_t>(node->value_));
+  } else if (T_BOOL == node->type_) {
+    out.set_bool(0 != node->value_);
+  } else if (T_OP_NEG == node->type_ && 1 == node->num_child_ && NULL != node->children_[0]
+             && T_INT == node->children_[0]->type_) {
+    out.set_int(-static_cast<int64_t>(node->children_[0]->value_));
+  } else {
+    ret = OB_ERR_UNEXPECTED;
+  }
+  return ret;
+}
+
+static int ft_get_const_varchar(const ParseNode *node, const ParamStore *ps, ObString &out)
+{
+  int ret = OB_SUCCESS;
+  ObObj obj;
+  if (OB_FAIL(ft_get_const_obj(node, ps, obj))) {
+  } else if (OB_FAIL(obj.get_varchar(out))) {
+  }
+  return ret;
+}
+
+static int ft_get_const_int(const ParseNode *node, const ParamStore *ps, int64_t &v)
+{
+  int ret = OB_SUCCESS;
+  ObObj obj;
+  if (OB_FAIL(ft_get_const_obj(node, ps, obj))) {
+  } else if (obj.is_numeric_type()) {
+    v = obj.get_int();
+  } else if (OB_FAIL(obj.get_int(v))) {
+  }
+  return ret;
+}
+
+static int ft_get_const_bool(const ParseNode *node, const ParamStore *ps, bool &v)
+{
+  int ret = OB_SUCCESS;
+  ObObj obj;
+  if (OB_FAIL(ft_get_const_obj(node, ps, obj))) {
+  } else if (obj.is_numeric_type()) {
+    v = obj.get_bool();
+  } else if (OB_FAIL(obj.get_bool(v))) {
+  }
+  return ret;
+}
+
+namespace {
+
+struct PqReader
+{
+  const unsigned char *buf;
+  int64_t len;
+  int64_t pos;
+  explicit PqReader(const unsigned char *b, int64_t l) : buf(b), len(l), pos(0) {}
+  bool eof() const { return pos >= len; }
+  uint64_t varint()
+  {
+    uint64_t res = 0;
+    int shift = 0;
+    while (pos < len) {
+      const unsigned char c = buf[pos++];
+      res |= static_cast<uint64_t>(c & 0x7f) << shift;
+      if (0 == (c & 0x80)) { break; }
+      shift += 7;
+    }
+    return res;
+  }
+  int64_t zigzag()
+  {
+    const uint64_t v = varint();
+    return static_cast<int64_t>((v >> 1) ^ (~(v & 1) + 1));
+  }
+};
+
+static bool pq_skip_value(PqReader &r, const int type);
+
+static bool pq_skip_struct(PqReader &r)
+{
+  bool ok = true;
+  int last = 0;
+  while (ok) {
+    if (r.eof()) { ok = false; break; }
+    const unsigned char hdr = r.buf[r.pos++];
+    if (0 == hdr) { break; }
+    const int type = hdr & 0x0f;
+    if (0 == (hdr >> 4)) { last = static_cast<int>(r.varint()); }
+    else { last += (hdr >> 4); }
+    if (12 == type) { ok = pq_skip_struct(r); }
+    else { ok = pq_skip_value(r, type); }
+  }
+  return ok;
+}
+
+static bool pq_skip_value(PqReader &r, const int type)
+{
+  bool ok = true;
+  switch (type) {
+    case 1: case 2: break;
+    case 3: r.pos += 1; break;
+    case 4: case 5: case 6: (void)r.varint(); break;
+    case 7: r.pos += 8; break;
+    case 8: { const uint64_t n = r.varint(); r.pos += static_cast<int64_t>(n); break; }
+    case 9: case 10: {
+      if (r.eof()) { ok = false; break; }
+      const unsigned char hdr = r.buf[r.pos++];
+      uint64_t size = hdr >> 4;
+      const int et = hdr & 0x0f;
+      if (15 == size) { size = r.varint(); }
+      for (uint64_t i = 0; ok && i < size; ++i) {
+        ok = (12 == et) ? pq_skip_struct(r) : pq_skip_value(r, et);
+      }
+      break;
+    }
+    case 11: {
+      const uint64_t size = r.varint();
+      if (0 != size) {
+        if (r.eof()) { ok = false; break; }
+        const unsigned char kv = r.buf[r.pos++];
+        const int kt = kv >> 4;
+        const int vt = kv & 0x0f;
+        for (uint64_t i = 0; ok && i < size; ++i) {
+          ok = (12 == kt) ? pq_skip_struct(r) : pq_skip_value(r, kt);
+          if (ok) { ok = (12 == vt) ? pq_skip_struct(r) : pq_skip_value(r, vt); }
+        }
+      }
+      break;
+    }
+    case 12: ok = pq_skip_struct(r); break;
+    default: ok = false; break;
+  }
+  if (r.pos > r.len) { ok = false; }
+  return ok;
+}
+
+static bool pq_next_field(PqReader &r, int &last_id, int &type, int &id)
+{
+  bool ok = true;
+  if (r.eof()) {
+    ok = false;
+  } else {
+    const unsigned char hdr = r.buf[r.pos++];
+    if (0 == hdr) {
+      ok = false;
+    } else {
+      type = hdr & 0x0f;
+      const int delta = hdr >> 4;
+      if (0 == delta) { id = static_cast<int>(r.varint()); }
+      else { id = last_id + delta; }
+      last_id = id;
+    }
+  }
+  return ok;
+}
+
+static int pq_snappy_decode(const unsigned char *in, const int64_t in_len,
+                            char *out, const int64_t out_cap, int64_t &out_len)
+{
+  int ret = OB_SUCCESS;
+  PqReader r(in, in_len);
+  int64_t written = 0;
+  const int64_t expected = static_cast<int64_t>(r.varint());
+  if (expected < 0 || expected > out_cap) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    while (OB_SUCC(ret) && r.pos < r.len && written < expected) {
+      const unsigned char tag = r.buf[r.pos++];
+      const int kind = tag & 0x03;
+      if (0 == kind) {
+        int64_t lit_len = tag >> 2;
+        if (lit_len < 60) {
+          ++lit_len;
+        } else {
+          const int extra = static_cast<int>(lit_len) - 59;
+          lit_len = 0;
+          for (int i = 0; i < extra && r.pos < r.len; ++i) {
+            lit_len |= static_cast<int64_t>(r.buf[r.pos++]) << (8 * i);
+          }
+          ++lit_len;
+        }
+        if (r.pos + lit_len > r.len || written + lit_len > out_cap) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          MEMCPY(out + written, r.buf + r.pos, lit_len);
+          r.pos += lit_len;
+          written += lit_len;
+        }
+      } else {
+        int64_t copy_len = 0;
+        int64_t offset = 0;
+        if (1 == kind) {
+          copy_len = ((tag >> 2) & 0x07) + 4;
+          if (r.pos >= r.len) { ret = OB_ERR_UNEXPECTED; break; }
+          offset = (static_cast<int64_t>(tag >> 5) << 8) | r.buf[r.pos++];
+        } else if (2 == kind) {
+          copy_len = (tag >> 2) + 1;
+          if (r.pos + 2 > r.len) { ret = OB_ERR_UNEXPECTED; break; }
+          offset = static_cast<int64_t>(r.buf[r.pos]) | (static_cast<int64_t>(r.buf[r.pos + 1]) << 8);
+          r.pos += 2;
+        } else {
+          copy_len = (tag >> 2) + 1;
+          if (r.pos + 4 > r.len) { ret = OB_ERR_UNEXPECTED; break; }
+          offset = static_cast<int64_t>(r.buf[r.pos]) | (static_cast<int64_t>(r.buf[r.pos + 1]) << 8)
+                   | (static_cast<int64_t>(r.buf[r.pos + 2]) << 16) | (static_cast<int64_t>(r.buf[r.pos + 3]) << 24);
+          r.pos += 4;
+        }
+        if (offset <= 0 || offset > written || written + copy_len > out_cap) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          for (int64_t i = 0; i < copy_len; ++i) {
+            out[written] = out[written - offset];
+            ++written;
+          }
+        }
+      }
+    }
+    if (OB_SUCC(ret)) { out_len = written; }
+  }
+  return ret;
+}
+
+static bool pq_rle_bitpacked(const unsigned char *buf, const int64_t len,
+                             const int bit_width, const int64_t need,
+                             int64_t *values, int64_t &got)
+{
+  bool ok = true;
+  PqReader r(buf, len);
+  got = 0;
+  while (ok && got < need && r.pos < r.len) {
+    const uint64_t header = r.varint();
+    if (header & 1) {
+      const int64_t groups = static_cast<int64_t>(header >> 1);
+      const int64_t count = groups * 8;
+      const int64_t bytes = (count * bit_width + 7) / 8;
+      if (r.pos + bytes > r.len) { ok = false; break; }
+      const unsigned char *src = r.buf + r.pos;
+      for (int64_t i = 0; ok && i < count && got < need; ++i) {
+        int64_t v = 0;
+        for (int b = 0; b < bit_width; ++b) {
+          const int64_t bit = i * bit_width + b;
+          if (src[bit >> 3] & (1 << (bit & 7))) { v |= (int64_t)1 << b; }
+        }
+        values[got++] = v;
+      }
+      r.pos += bytes;
+    } else {
+      const int64_t run = static_cast<int64_t>(header >> 1);
+      const int64_t bytes = (bit_width + 7) / 8;
+      if (r.pos + bytes > r.len) { ok = false; break; }
+      int64_t v = 0;
+      for (int64_t b = 0; b < bytes; ++b) { v |= static_cast<int64_t>(r.buf[r.pos + b]) << (8 * b); }
+      r.pos += bytes;
+      for (int64_t i = 0; i < run && got < need; ++i) { values[got++] = v; }
+    }
+  }
+  return ok;
+}
+
+struct PqColumn
+{
+  PqColumn() : type_(0), codec_(0), num_values_(0), data_page_offset_(0), dict_page_offset_(-1), max_def_(0) {}
+  int type_;
+  int codec_;
+  int64_t num_values_;
+  int64_t data_page_offset_;
+  int64_t dict_page_offset_;
+  int max_def_;
+  ObString name_;
+};
+
+static int ft_read_parquet(common::ObIAllocator &alloc,
+                           const common::ObString &content,
+                           ObIArray<common::ObString> &cells,
+                           ObIArray<common::ObString> &col_names,
+                           int64_t &col_cnt,
+                           int64_t &row_cnt)
+{
+  int ret = OB_SUCCESS;
+  const unsigned char *data = reinterpret_cast<const unsigned char *>(content.ptr());
+  const int64_t total = content.length();
+  int64_t footer_len = 0;
+  if (total < 12 || 0 != ::memcmp(data, "PAR1", 4) || 0 != ::memcmp(data + total - 4, "PAR1", 4)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    footer_len = static_cast<int64_t>(data[total - 8]) | (static_cast<int64_t>(data[total - 7]) << 8)
+                 | (static_cast<int64_t>(data[total - 6]) << 16) | (static_cast<int64_t>(data[total - 5]) << 24);
+  }
+  ObSEArray<PqColumn, 16> cols;
+  int64_t num_rows = 0;
+  if (OB_FAIL(ret)) {
+  } else {
+    const int64_t footer_off = total - 8 - footer_len;
+    if (footer_off < 4 || footer_off >= total) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      PqReader r(data + footer_off, footer_len);
+      int last = 0, type = 0, id = 0;
+      while (OB_SUCC(ret) && pq_next_field(r, last, type, id)) {
+        if (3 == id && 6 == type) {
+          num_rows = r.zigzag();
+        } else if (2 == id && 9 == type) {
+          // schema list
+          const unsigned char hdr = r.buf[r.pos++];
+          uint64_t size = hdr >> 4;
+          if (15 == size) { size = r.varint(); }
+          for (uint64_t i = 0; OB_SUCC(ret) && i < size; ++i) {
+            PqColumn col;
+            int sl = 0, st = 0, sid = 0;
+            while (pq_next_field(r, sl, st, sid)) {
+              if (1 == sid && 5 == st) { col.type_ = static_cast<int>(r.zigzag()); }
+              else if (3 == sid && 5 == st) {
+                const int64_t rep = r.zigzag();
+                col.max_def_ = (1 == rep) ? 1 : 0;
+              } else if (4 == sid && 8 == st) {
+                const uint64_t n = r.varint();
+                char *nm = static_cast<char *>(alloc.alloc(static_cast<int64_t>(n) + 1));
+                if (NULL == nm) { ret = OB_ALLOCATE_MEMORY_FAILED; break; }
+                MEMCPY(nm, r.buf + r.pos, n);
+                nm[n] = '\0';
+                col.name_.assign_ptr(nm, static_cast<int32_t>(n));
+                r.pos += static_cast<int64_t>(n);
+              } else if (false == pq_skip_value(r, st)) { ret = OB_ERR_UNEXPECTED; break; }
+            }
+            if (OB_FAIL(ret)) { break; }
+            if (!col.name_.empty() && 0 != col.type_) {
+              if (OB_FAIL(cols.push_back(col))) { break; }
+            }
+          }
+        } else if (4 == id && 9 == type) {
+          // row groups; parse first only
+          const unsigned char hdr = r.buf[r.pos++];
+          uint64_t size = hdr >> 4;
+          if (15 == size) { size = r.varint(); }
+          for (uint64_t rg = 0; OB_SUCC(ret) && rg < size; ++rg) {
+            int rl = 0, rt = 0, rid = 0;
+            while (pq_next_field(r, rl, rt, rid)) {
+              if (1 == rid && 9 == rt) {
+                const unsigned char ch = r.buf[r.pos++];
+                uint64_t csize = ch >> 4;
+                if (15 == csize) { csize = r.varint(); }
+                for (uint64_t ci = 0; OB_SUCC(ret) && ci < csize && ci < (uint64_t)cols.count(); ++ci) {
+                  int cl = 0, ct = 0, cid = 0;
+                  while (pq_next_field(r, cl, ct, cid)) {
+                    if (3 == cid && 12 == ct) {
+                      int ml = 0, mt = 0, mid = 0;
+                      while (pq_next_field(r, ml, mt, mid)) {
+                        if (1 == mid && 5 == mt) { cols.at(ci).type_ = static_cast<int>(r.zigzag()); }
+                        else if (4 == mid && 5 == mt) { cols.at(ci).codec_ = static_cast<int>(r.zigzag()); }
+                        else if (5 == mid && 6 == mt) { cols.at(ci).num_values_ = r.zigzag(); }
+                        else if (9 == mid && 6 == mt) { cols.at(ci).data_page_offset_ = r.zigzag(); }
+                        else if (11 == mid && 6 == mt) { cols.at(ci).dict_page_offset_ = r.zigzag(); }
+                        else if (false == pq_skip_value(r, mt)) { ret = OB_ERR_UNEXPECTED; break; }
+                      }
+                    } else if (false == pq_skip_value(r, ct)) { ret = OB_ERR_UNEXPECTED; break; }
+                  }
+                }
+              } else if (false == pq_skip_value(r, rt)) { ret = OB_ERR_UNEXPECTED; break; }
+              if (rg > 0) { break; }
+            }
+            break;
+          }
+        } else if (false == pq_skip_value(r, type)) {
+          ret = OB_ERR_UNEXPECTED;
+        }
+      }
+    }
+  }
+  // decode each column
+  typedef ObSEArray<ObString, 64> PqStrArray;
+  ObSEArray<PqStrArray *, 16> col_values;
+  if (OB_FAIL(ret)) {
+  } else if (0 == cols.count() || num_rows <= 0) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    for (int64_t c = 0; OB_SUCC(ret) && c < cols.count(); ++c) {
+      PqColumn &col = cols.at(c);
+      PqStrArray *vals = OB_NEWx(PqStrArray, &alloc);
+      if (NULL == vals) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        break;
+      }
+      int64_t page_off = col.data_page_offset_;
+      int64_t decoded = 0;
+      while (OB_SUCC(ret) && page_off > 0 && page_off < total && decoded < col.num_values_) {
+        PqReader pr(data + page_off, total - page_off);
+        int last = 0, ptype = 0, pid = 0;
+        int64_t page_type = -1, uncomp_size = 0, comp_size = 0;
+        int64_t v2_num_values = 0, v2_encoding = 0, v2_def_len = 0, v2_rep_len = 0;
+        bool v2_compressed = false;
+        int64_t header_len = 0;
+        while (pq_next_field(pr, last, ptype, pid)) {
+          if (1 == pid && 5 == ptype) { page_type = pr.zigzag(); }
+          else if (2 == pid && 5 == ptype) { uncomp_size = pr.zigzag(); }
+          else if (3 == pid && 5 == ptype) { comp_size = pr.zigzag(); }
+          else if (8 == pid && 12 == ptype) {
+            int dl = 0, dt = 0, did = 0;
+            while (pq_next_field(pr, dl, dt, did)) {
+              if (1 == did && 5 == dt) { v2_num_values = pr.zigzag(); }
+              else if (4 == did && 5 == dt) { v2_encoding = pr.zigzag(); }
+              else if (5 == did && 5 == dt) { v2_def_len = pr.zigzag(); }
+              else if (6 == did && 5 == dt) { v2_rep_len = pr.zigzag(); }
+              else if (7 == did && 1 == dt) { v2_compressed = true; }
+              else if (7 == did && 2 == dt) { v2_compressed = false; }
+              else if (!pq_skip_value(pr, dt)) { ret = OB_ERR_UNEXPECTED; break; }
+            }
+          } else if (!pq_skip_value(pr, ptype)) { ret = OB_ERR_UNEXPECTED; break; }
+        }
+        header_len = pr.pos;
+        if (OB_FAIL(ret)) { break; }
+        const unsigned char *payload = data + page_off + header_len;
+        const int64_t payload_len = comp_size;
+        if (3 != page_type) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_WARN("parquet page type not supported", K(page_type));
+          break;
+        }
+        // definition levels
+        int64_t values_count = v2_num_values;
+        ObSEArray<int64_t, 64> levels;
+        for (int64_t i = 0; i < v2_num_values; ++i) {
+          if (OB_FAIL(levels.push_back(1))) { break; }
+        }
+        if (OB_FAIL(ret)) { break; }
+        if (v2_def_len > 0 && col.max_def_ > 0) {
+          int bit_width = 1;
+          int64_t got = 0;
+          levels.reset();
+          for (int64_t i = 0; i < v2_num_values; ++i) { levels.push_back(0); }
+          if (!pq_rle_bitpacked(payload, v2_def_len, bit_width, v2_num_values, &levels.at(0), got)) {
+            ret = OB_ERR_UNEXPECTED;
+            break;
+          }
+        }
+        // values section
+        const unsigned char *val_ptr = payload + v2_def_len + v2_rep_len;
+        int64_t val_len = payload_len - v2_def_len - v2_rep_len;
+        char *decomp = NULL;
+        if (v2_compressed && 1 == col.codec_) {
+          const int64_t cap = uncomp_size - v2_def_len - v2_rep_len + 16;
+          decomp = static_cast<char *>(alloc.alloc(cap + 1));
+          if (NULL == decomp) { ret = OB_ALLOCATE_MEMORY_FAILED; break; }
+          int64_t out_len = 0;
+          int tmp = pq_snappy_decode(val_ptr, val_len, decomp, cap, out_len);
+          if (OB_SUCCESS != tmp) { ret = tmp; break; }
+          val_ptr = reinterpret_cast<const unsigned char *>(decomp);
+          val_len = out_len;
+        }
+        // decode plain values
+        int64_t non_null = 0;
+        for (int64_t i = 0; i < v2_num_values; ++i) {
+          if (levels.at(i) > 0) { ++non_null; }
+        }
+        PqReader vr(val_ptr, val_len);
+        for (int64_t i = 0; OB_SUCC(ret) && i < v2_num_values; ++i) {
+          ObString cell;
+          if (levels.at(i) <= 0) {
+            cell.reset();
+          } else {
+            char *nb = static_cast<char *>(alloc.alloc(48));
+            if (NULL == nb) { ret = OB_ALLOCATE_MEMORY_FAILED; break; }
+            int nlen = 0;
+            if (1 == col.type_) {
+              if (vr.pos + 4 > vr.len) { ret = OB_ERR_UNEXPECTED; break; }
+              int32_t v = static_cast<int32_t>(vr.buf[vr.pos]) | (static_cast<int32_t>(vr.buf[vr.pos + 1]) << 8)
+                          | (static_cast<int32_t>(vr.buf[vr.pos + 2]) << 16) | (static_cast<int32_t>(vr.buf[vr.pos + 3]) << 24);
+              vr.pos += 4;
+              nlen = ::snprintf(nb, 48, "%d", v);
+            } else if (2 == col.type_) {
+              if (vr.pos + 8 > vr.len) { ret = OB_ERR_UNEXPECTED; break; }
+              int64_t v = 0;
+              for (int b = 7; b >= 0; --b) { v = (v << 8) | static_cast<int64_t>(vr.buf[vr.pos + b]); }
+              vr.pos += 8;
+              nlen = ::snprintf(nb, 48, "%ld", v);
+            } else if (5 == col.type_) {
+              if (vr.pos + 8 > vr.len) { ret = OB_ERR_UNEXPECTED; break; }
+              double d = 0;
+              MEMCPY(&d, vr.buf + vr.pos, 8);
+              vr.pos += 8;
+              nlen = ::snprintf(nb, 48, "%.17g", d);
+            } else if (6 == col.type_) {
+              if (vr.pos + 4 > vr.len) { ret = OB_ERR_UNEXPECTED; break; }
+              int32_t n = static_cast<int32_t>(vr.buf[vr.pos]) | (static_cast<int32_t>(vr.buf[vr.pos + 1]) << 8)
+                          | (static_cast<int32_t>(vr.buf[vr.pos + 2]) << 16) | (static_cast<int32_t>(vr.buf[vr.pos + 3]) << 24);
+              vr.pos += 4;
+              if (n < 0 || vr.pos + n > vr.len) { ret = OB_ERR_UNEXPECTED; break; }
+              cell.assign_ptr(reinterpret_cast<const char *>(vr.buf + vr.pos), n);
+              vr.pos += n;
+            } else {
+              ret = OB_NOT_SUPPORTED;
+              break;
+            }
+            if (OB_SUCC(ret) && cell.empty() && NULL != nb) {
+              cell.assign_ptr(nb, nlen);
+            }
+          }
+          if (OB_SUCC(ret) && OB_FAIL(vals->push_back(cell))) { break; }
+        }
+        if (OB_FAIL(ret)) { break; }
+        decoded += v2_num_values;
+        page_off += header_len + payload_len;
+      }
+      if (OB_SUCC(ret) && OB_FAIL(col_values.push_back(vals))) {
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else {
+    col_cnt = cols.count();
+    row_cnt = num_rows;
+    for (int64_t c = 0; OB_SUCC(ret) && c < col_cnt; ++c) {
+      if (OB_FAIL(col_names.push_back(cols.at(c).name_))) { break; }
+    }
+    for (int64_t r = 0; OB_SUCC(ret) && r < row_cnt; ++r) {
+      for (int64_t c = 0; OB_SUCC(ret) && c < col_cnt; ++c) {
+        ObString v;
+        PqStrArray *vals = col_values.at(c);
+        if (NULL != vals && r < vals->count()) { v = vals->at(r); }
+        if (OB_FAIL(cells.push_back(v))) { break; }
+      }
+    }
+  }
+  return ret;
+}
+
+}  // namespace
+
+int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableItem *&table_item)
+{
+  int ret = OB_SUCCESS;
+  ObDMLStmt *stmt = get_stmt();
+  TableItem *item = NULL;
+  ObValuesTableDef *table_def = NULL;
+  const ParseNode *arg_list = parse_tree.num_child_ > 0 ? parse_tree.children_[0] : NULL;
+  const ParseNode *alias_node = parse_tree.num_child_ > 1 ? parse_tree.children_[1] : NULL;
+  const int64_t kind = parse_tree.value_;
+  ObString file_path;
+  ObString fmt_str;
+  bool header = true;
+  bool has_sample_size = false;
+  int64_t sample_size = -1;
+  int64_t var_int = 0;
+  ObSEArray<common::ObString, 256> cells;
+  ObSEArray<common::ObString, 32> col_names;
+  ObSEArray<FtColType, 32> col_types;
+  int64_t col_cnt = 0;
+  int64_t row_cnt = 0;
+  int64_t data_start = 0;
+
+  if (OB_ISNULL(session_info_) || OB_ISNULL(stmt) || OB_ISNULL(allocator_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(session_info_->get_sys_variable(share::SYS_VAR_ENABLE_FILE_SQL, var_int))) {
+    LOG_WARN("failed to read enable_file_sql", K(ret));
+  } else if (0 == var_int) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("file sql is not enabled");
+  }
+
+  for (int64_t i = 0; OB_SUCC(ret) && NULL != arg_list && i < arg_list->num_child_; ++i) {
+    const ParseNode *arg = arg_list->children_[i];
+    const ParseNode *name_node = NULL;
+    const ParseNode *val_node = arg;
+    ObString name;
+    LOG_INFO("ft arg top", "i", i, "type", (NULL == arg ? -1 : arg->type_),
+             "nchild", (NULL == arg ? -1 : arg->num_child_),
+             "c0", (NULL == arg || arg->num_child_ < 1 || NULL == arg->children_[0] ? -1 : arg->children_[0]->type_),
+             "c1", (NULL == arg || arg->num_child_ < 2 || NULL == arg->children_[1] ? -1 : arg->children_[1]->type_));
+    if (OB_ISNULL(arg)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (T_OP_EQ == arg->type_ && 2 == arg->num_child_) {
+      name_node = arg->children_[0];
+      val_node = arg->children_[1];
+      if (OB_ISNULL(name_node) || OB_ISNULL(val_node)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (T_IDENT == name_node->type_ && NULL != name_node->str_value_) {
+        name.assign_ptr(name_node->str_value_, name_node->str_len_);
+      } else if (T_COLUMN_REF == name_node->type_) {
+        if (NULL != name_node->str_value_) {
+          name.assign_ptr(name_node->str_value_, name_node->str_len_);
+        } else if (name_node->num_child_ > 0 && NULL != name_node->children_[0]
+                   && NULL != name_node->children_[0]->str_value_) {
+          name.assign_ptr(name_node->children_[0]->str_value_, name_node->children_[0]->str_len_);
+        } else {
+          ret = OB_ERR_UNEXPECTED;
+        }
+      } else {
+        ret = OB_ERR_UNEXPECTED;
+      }
+    }
+    if (OB_SUCC(ret) && NULL != name_node) {
+      LOG_INFO("ft named arg", "arg_type", arg->type_, "nchild", arg->num_child_,
+               "name", name, "val_type", (NULL == val_node ? -1 : val_node->type_));
+    }
+    if (OB_FAIL(ret)) {
+    } else if (NULL == name_node) {
+      ObString sval;
+      if (OB_FAIL(ft_get_const_varchar(val_node, params_.param_list_, sval))) {
+      } else if (file_path.empty()) {
+        file_path = sval;
+      } else if (fmt_str.empty()) {
+        fmt_str = sval;
+      } else {
+        ret = OB_NOT_SUPPORTED;
+      }
+    } else if (0 == name.case_compare("header")) {
+      bool bval = false;
+      if (OB_FAIL(ft_get_const_bool(val_node, params_.param_list_, bval))) {
+      } else {
+        header = bval;
+      }
+    } else if (0 == name.case_compare("sample_size")) {
+      int64_t ival = 0;
+      if (OB_FAIL(ft_get_const_int(val_node, params_.param_list_, ival))) {
+      } else {
+        has_sample_size = true;
+        sample_size = ival;
+      }
+    } else if (0 == name.case_compare("format")) {
+      ObString sval;
+      if (OB_FAIL(ft_get_const_varchar(val_node, params_.param_list_, sval))) {
+      } else {
+        fmt_str = sval;
+      }
+    } else {
+      ret = OB_NOT_SUPPORTED;
+    }
+  }
+
+  LOG_INFO("ft args", K(ret), K(file_path), K(fmt_str), K(header), K(has_sample_size), K(sample_size),
+           "param_list_null", (NULL == params_.param_list_),
+           "param_cnt", (NULL == params_.param_list_ ? -1 : params_.param_list_->count()));
+  if (OB_FAIL(ret)) {
+  } else if (file_path.empty()) {
+    ret = OB_ERR_PARSE_SQL;
+    LOG_INFO("file path is required");
+  } else if (has_sample_size && -1 != sample_size) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("sample_size other than -1 is not supported");
+  } else if (!fmt_str.empty()
+             && ((1 == kind && 0 != fmt_str.case_compare("csv") && 0 != fmt_str.case_compare("auto"))
+                 || (2 == kind && 0 != fmt_str.case_compare("newline_delimited")
+                     && 0 != fmt_str.case_compare("json")))) {
+    ret = OB_ERR_PARSE_SQL;
+    LOG_WARN("unsupported file format", K(fmt_str));
+  }
+
+  // read content
+  ObString content;
+  if (OB_FAIL(ret)) {
+  } else if (1 == kind || 2 == kind || 3 == kind) {
+    char *path_buf = static_cast<char *>(allocator_->alloc(file_path.length() + 1));
+    if (OB_ISNULL(path_buf)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      MEMCPY(path_buf, file_path.ptr(), file_path.length());
+      path_buf[file_path.length()] = '\0';
+      if (OB_FAIL(ft_read_file(*allocator_, path_buf, content))) {
+        LOG_WARN("failed to read file", K(ret), K(file_path));
+      }
+    }
+  }
+
+  if (OB_FAIL(ret)) {
+  } else if (1 == kind) {
+    if (OB_FAIL(ft_split_csv(*allocator_, content, cells, col_cnt, row_cnt))) {
+      LOG_WARN("failed to parse csv", K(ret));
+    } else {
+      data_start = header ? 1 : 0;
+    }
+  } else if (2 == kind) {
+    // jsonl: parse all lines, union keys
+    ObSEArray<common::ObString, 32> keys;
+    ObSEArray<common::ObString, 32> vals;
+    ObSEArray<int64_t, 32> row_offsets;
+    const char *p = content.ptr();
+    const int64_t n = content.length();
+    int64_t i = 0;
+    int64_t parsed_rows = 0;
+    while (OB_SUCC(ret) && i < n) {
+      int64_t line_start = i;
+      while (i < n && '\n' != p[i]) { ++i; }
+      int64_t line_end = i;
+      if (i < n) { ++i; }
+      while (line_end > line_start && ('\r' == p[line_end - 1] || ' ' == p[line_end - 1])) { --line_end; }
+      if (line_end <= line_start) { continue; }
+      if (OB_FAIL(row_offsets.push_back(keys.count()))) {
+      } else if (OB_FAIL(ft_parse_json_line(*allocator_, p + line_start, line_end - line_start, keys, vals))) {
+        LOG_WARN("failed to parse json line", K(ret));
+      } else {
+        ++parsed_rows;
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(row_offsets.push_back(keys.count()))) {
+    } else {
+      row_cnt = parsed_rows;
+      col_cnt = keys.count();
+      // column names: first occurrence order
+      for (int64_t k = 0; OB_SUCC(ret) && k < keys.count(); ++k) {
+        bool seen = false;
+        for (int64_t j = 0; j < col_names.count(); ++j) {
+          if (0 == keys.at(k).case_compare(col_names.at(j))) { seen = true; break; }
+        }
+        if (!seen && OB_FAIL(col_names.push_back(keys.at(k)))) {
+        }
+      }
+      col_cnt = col_names.count();
+      // cells row-major
+      for (int64_t r = 0; OB_SUCC(ret) && r < row_cnt; ++r) {
+        const int64_t begin = row_offsets.at(r);
+        const int64_t end = row_offsets.at(r + 1);
+        for (int64_t c = 0; OB_SUCC(ret) && c < col_cnt; ++c) {
+          ObString val;
+          for (int64_t k = begin; k < end; ++k) {
+            if (0 == keys.at(k).case_compare(col_names.at(c))) { val = vals.at(k); break; }
+          }
+          if (OB_FAIL(cells.push_back(val))) {
+          }
+        }
+      }
+    }
+  } else if (4 == kind) {
+    ObSEArray<common::ObString, 32> files;
+    if (OB_FAIL(ft_glob_files(*allocator_, file_path, files))) {
+    } else {
+      col_cnt = 1;
+      row_cnt = files.count();
+      if (OB_FAIL(col_names.push_back(ObString::make_string("file")))) {
+      }
+      for (int64_t k = 0; OB_SUCC(ret) && k < files.count(); ++k) {
+        if (OB_FAIL(cells.push_back(files.at(k)))) {
+        }
+      }
+    }
+  } else if (3 == kind) {
+    if (OB_FAIL(ft_read_parquet(*allocator_, content, cells, col_names, col_cnt, row_cnt))) {
+      LOG_WARN("failed to read parquet", K(ret));
+    } else {
+      data_start = 0;
+    }
+  } else {
+    ret = OB_NOT_SUPPORTED;
+  }
+
+  LOG_INFO("ft parsed", K(ret), K(col_cnt), K(row_cnt), K(data_start), K(kind));
+  if (OB_FAIL(ret)) {
+  } else if (0 == col_cnt || 0 == row_cnt) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("empty file table", K(col_cnt), K(row_cnt));
+  }
+  // infer column names for csv
+  if (OB_FAIL(ret)) {
+  } else if (1 == kind) {
+    for (int64_t c = 0; OB_SUCC(ret) && c < col_cnt; ++c) {
+      ObString nm;
+      if (header && c < cells.count()) {
+        nm = cells.at(c);
+      }
+      if (nm.empty()) {
+        char nb[32];
+        int len = ::snprintf(nb, sizeof(nb), "c%ld", c + 1);
+        char *copy = static_cast<char *>(allocator_->alloc(len + 1));
+        if (OB_ISNULL(copy)) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+        } else {
+          MEMCPY(copy, nb, len + 1);
+          nm.assign_ptr(copy, len);
+        }
+      }
+      if (OB_SUCC(ret)) {
+        ObString final_name = nm;
+        int64_t dup = 0;
+        for (int64_t j = 0; OB_SUCC(ret) && j < col_names.count(); ++j) {
+          if (0 == final_name.case_compare(col_names.at(j))) { ++dup; }
+        }
+        if (OB_SUCC(ret) && dup > 0) {
+          char suffix[16];
+          int slen = ::snprintf(suffix, sizeof(suffix), "__%ld", dup + 1);
+          char *copy = static_cast<char *>(allocator_->alloc(final_name.length() + slen + 1));
+          if (OB_ISNULL(copy)) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+          } else {
+            MEMCPY(copy, final_name.ptr(), final_name.length());
+            MEMCPY(copy + final_name.length(), suffix, slen);
+            copy[final_name.length() + slen] = '\0';
+            final_name.assign_ptr(copy, final_name.length() + slen);
+          }
+        }
+        if (OB_SUCC(ret) && OB_FAIL(col_names.push_back(final_name))) {
+        }
+      }
+    }
+  }
+
+  // infer types
+  if (OB_FAIL(ret)) {
+  } else {
+    for (int64_t c = 0; OB_SUCC(ret) && c < col_cnt; ++c) {
+      FtColType t = FT_TYPE_INT;
+      for (int64_t r = data_start; OB_SUCC(ret) && r < row_cnt; ++r) {
+        const int64_t idx = r * col_cnt + c;
+        if (idx >= cells.count()) { break; }
+        const ObString &cell = cells.at(idx);
+        if (cell.empty()) { continue; }
+        int64_t iv = 0;
+        double dv = 0;
+        bool bv = false;
+        int32_t days = 0;
+        int64_t usec = 0;
+        if (FT_TYPE_INT == t && !ft_parse_int(cell, iv)) { t = FT_TYPE_DOUBLE; }
+        if (FT_TYPE_DOUBLE == t && !ft_parse_double(cell, dv)) { t = FT_TYPE_BOOL; }
+        if (FT_TYPE_BOOL == t && !ft_parse_bool(cell, bv)) { t = FT_TYPE_DATE; }
+        if (FT_TYPE_DATE == t && !ft_parse_date(cell, days)) { t = FT_TYPE_DATETIME; }
+        if (FT_TYPE_DATETIME == t && !ft_parse_datetime(cell, usec)) { t = FT_TYPE_VARCHAR; break; }
+      }
+      if (OB_SUCC(ret) && OB_FAIL(col_types.push_back(t))) {
+      }
+    }
+  }
+
+  // build values table
+  if (OB_FAIL(ret)) {
+  } else if (OB_ISNULL(item = stmt->create_table_item(*allocator_))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else if (OB_ISNULL(table_def = static_cast<ObValuesTableDef *>(allocator_->alloc(sizeof(ObValuesTableDef))))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else {
+    table_def = new (table_def) ObValuesTableDef();
+    table_def->column_cnt_ = col_cnt;
+    table_def->row_cnt_ = row_cnt - data_start;
+    table_def->access_type_ = ObValuesTableDef::ACCESS_OBJ;
+    table_def->is_const_ = true;
+  }
+
+  for (int64_t r = data_start; OB_SUCC(ret) && r < row_cnt; ++r) {
+    for (int64_t c = 0; OB_SUCC(ret) && c < col_cnt; ++c) {
+      const int64_t idx = r * col_cnt + c;
+      ObString cell;
+      if (idx < cells.count()) { cell = cells.at(idx); }
+      ObObjParam op;
+      if (cell.empty()) {
+        op.set_null();
+      } else {
+        int64_t iv = 0;
+        double dv = 0;
+        bool bv = false;
+        int32_t days = 0;
+        int64_t usec = 0;
+        switch (col_types.at(c)) {
+          case FT_TYPE_INT:
+            ft_parse_int(cell, iv);
+            op.set_int(iv);
+            break;
+          case FT_TYPE_DOUBLE:
+            ft_parse_double(cell, dv);
+            op.set_double(dv);
+            break;
+          case FT_TYPE_BOOL:
+            ft_parse_bool(cell, bv);
+            op.set_tinyint(bv ? 1 : 0);
+            break;
+          case FT_TYPE_DATE:
+            ft_parse_date(cell, days);
+            op.set_date(days);
+            break;
+          case FT_TYPE_DATETIME:
+            ft_parse_datetime(cell, usec);
+            op.set_datetime(usec);
+            break;
+          default:
+            op.set_varchar(cell);
+            op.set_collation_type(CS_TYPE_UTF8MB4_GENERAL_CI);
+            op.set_collation_level(CS_LEVEL_IMPLICIT);
+            break;
+        }
+      }
+      op.set_param_meta();
+      if (OB_FAIL(table_def->access_objs_.push_back(op))) {
+      }
+    }
+  }
+
+  if (OB_FAIL(ret)) {
+  } else {
+    for (int64_t c = 0; OB_SUCC(ret) && c < col_cnt; ++c) {
+      ObRawExprResType rt;
+      bool found = false;
+      for (int64_t r = 0; OB_SUCC(ret) && !found && r < table_def->row_cnt_; ++r) {
+        const int64_t idx2 = r * col_cnt + c;
+        if (idx2 < table_def->access_objs_.count()) {
+          const ObObjParam &p2 = table_def->access_objs_.at(idx2);
+          if (!p2.is_null()) {
+            rt.set_meta(p2.get_param_meta());
+            rt.set_accuracy(p2.get_accuracy());
+            rt.set_result_flag(p2.get_result_flag());
+            found = true;
+          }
+        }
+      }
+      if (OB_SUCC(ret) && !found) {
+        rt.set_type(ObVarcharType);
+        rt.set_collation_type(CS_TYPE_UTF8MB4_GENERAL_CI);
+        rt.set_collation_level(CS_LEVEL_IMPLICIT);
+      }
+      if (OB_SUCC(ret) && OB_FAIL(table_def->column_types_.push_back(rt))) {
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(estimate_values_table_stats(*table_def))) {
+  }
+
+  if (OB_FAIL(ret)) {
+  } else {
+    ObString alias_name;
+    if (NULL != alias_node && NULL != alias_node->str_value_) {
+      alias_name.assign_ptr(alias_node->str_value_, alias_node->str_len_);
+    } else {
+      alias_name = ObString::make_string(1 == kind ? "read_csv"
+                                        : (2 == kind ? "read_json"
+                                           : (4 == kind ? "glob" : "read_parquet")));
+    }
+    item->table_id_ = generate_table_id();
+    item->table_name_ = alias_name;
+    item->alias_name_ = alias_name;
+    item->type_ = TableItem::VALUES_TABLE;
+    item->values_table_def_ = table_def;
+    item->is_view_table_ = false;
+    if (OB_FAIL(stmt->add_table_item(session_info_, item))) {
+    } else {
+      for (int64_t c = 0; OB_SUCC(ret) && c < col_cnt; ++c) {
+        ObColumnRefRawExpr *column_expr = NULL;
+        if (OB_FAIL(params_.expr_factory_->create_raw_expr(T_REF_COLUMN, column_expr))) {
+        } else if (OB_ISNULL(column_expr)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          column_expr->set_result_type(table_def->column_types_.at(c));
+          column_expr->set_ref_id(item->table_id_, c + OB_APP_MIN_COLUMN_ID);
+          column_expr->set_column_attr(item->table_name_, col_names.at(c));
+          if (OB_FAIL(column_expr->add_flag(IS_COLUMN))) {
+          } else {
+            ColumnItem column_item;
+            column_item.expr_ = column_expr;
+            column_item.table_id_ = column_expr->get_table_id();
+            column_item.column_id_ = column_expr->get_column_id();
+            column_item.column_name_ = column_expr->get_column_name();
+            if (OB_FAIL(stmt->add_column_item(column_item))) {
+            }
+          }
+        }
+      }
+      if (OB_SUCC(ret)) {
+        table_item = item;
+      }
+    }
+  }
+  LOG_INFO("ft done", K(ret), "ok", (NULL != table_item));
   return ret;
 }
 
