@@ -131,6 +131,10 @@ static const uint64_t OB_MIN_ID  = 0;//used for lower_bound
 #define GENERATED_DEPS_CASCADE_FLAG (INT64_C(1) << 32)
 #define GENERATED_FTS_WORD_COUNT_COLUMN_FLAG (INT64_C(1) << 33) // word count column for full-text search index
 #define TABLE_PART_KEY_COLUMN_FLAG (INT64_C(1) << 34)
+#define AI_COLUMN_RESULT_FLAG (INT64_C(1) << 50)          // user visible result column of an AI column
+#define AI_COLUMN_HIDDEN_STATE_FLAG (INT64_C(1) << 51)    // hidden state column of an AI column
+#define AI_COLUMN_HIDDEN_REQUEST_FLAG (INT64_C(1) << 52)  // hidden request id column of an AI column
+#define AI_COLUMN_HIDDEN_SPEC_FLAG (INT64_C(1) << 53)     // hidden definition column of an AI column
 #define TABLE_ALIAS_NAME_FLAG (INT64_C(1) << 35)
 /* create table t1(c1 int, c2 as (c1+1)) partition by hash(c2) partitions 2
    c1 and c2 has flag TABLE_PART_KEY_COLUMN_ORG_FLAG */
