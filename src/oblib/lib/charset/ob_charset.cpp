@@ -563,6 +563,43 @@ int ObCharset::strcmp(ObCollationType collation_type,
   return result;
 }
 
+
+// Binary collations order by code point; for valid UTF-8 that is exactly the
+// byte order, so the generic character-wise path only pays decoding cost.
+// Comparing the raw bytes keeps the same relation for CS_TYPE_*_BIN and
+// CS_TYPE_BINARY while avoiding per-character decoding in hot sort paths.
+static int ob_binary_strcmpsp(const char *s1, const int64_t l1,
+                              const char *s2, const int64_t l2,
+                              const bool endspace)
+{
+  int result = 0;
+  const int64_t common = l1 < l2 ? l1 : l2;
+  if (common > 0) {
+    result = memcmp(s1, s2, static_cast<size_t>(common));
+  }
+  if (0 == result) {
+    if (!endspace) {
+      result = l1 == l2 ? 0 : (l1 < l2 ? -1 : 1);
+    } else {
+      // PAD SPACE: a longer value that ends in spaces equals the shorter one.
+      const char *rest = l1 > l2 ? s1 : s2;
+      const int64_t rest_len = l1 > l2 ? l1 - l2 : l2 - l1;
+      int64_t idx = 0;
+      while (idx < rest_len && ' ' == rest[idx]) {
+        ++idx;
+      }
+      if (idx == rest_len) {
+        result = 0;
+      } else {
+        result = l1 > l2 ? 1 : -1;
+      }
+    }
+  } else {
+    result = result > 0 ? 1 : -1;
+  }
+  return result;
+}
+
 int ObCharset::strcmpsp(ObCollationType collation_type,
                         const char *str1,
                         int64_t str1_len,
@@ -572,6 +609,9 @@ int ObCharset::strcmpsp(ObCollationType collation_type,
 {
   int result = 0;
   if (is_argument_valid(collation_type, str1, str1_len, str2, str2_len)) {
+    if (CS_TYPE_UTF8MB4_BIN == collation_type || CS_TYPE_BINARY == collation_type) {
+      result = ob_binary_strcmpsp(str1, str1_len, str2, str2_len, cmp_endspace);
+    } else {
     const ObCharsetInfo *cs = get_charset(collation_type);
     result = cs->coll->strnncollsp(cs,
                                 reinterpret_cast<const unsigned char *>(str1),
@@ -579,6 +619,7 @@ int ObCharset::strcmpsp(ObCollationType collation_type,
                                 reinterpret_cast<const unsigned char *>(str2),
                                 str2_len,
                                 cmp_endspace);
+    }
   }
   return result;
 }
