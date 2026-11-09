@@ -377,6 +377,8 @@ OBSERVER_UNITY_GROUPS = [
             "src/observer/virtual_table/ob_all_virtual_tmp_file.cpp",
             "src/observer/virtual_table/ob_all_virtual_change_stream_refresh_stat.cpp",
             "src/observer/virtual_table/ob_all_virtual_charset.cpp",
+            "src/observer/virtual_table/ob_all_ai_column_virtual_table.cpp",
+            "src/observer/virtual_table/ob_all_ai_column_task_virtual_table.cpp",
             "src/observer/virtual_table/ob_all_virtual_collation.cpp",
             "src/observer/virtual_table/ob_all_virtual_dump_info.cpp",
             "src/observer/virtual_table/ob_all_virtual_memstore_usage.cpp",

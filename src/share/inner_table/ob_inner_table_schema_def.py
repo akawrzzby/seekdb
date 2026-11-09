@@ -6385,6 +6385,50 @@ def_table_schema(
   ],
 )
 
+
+# 12565: __all_ai_column
+all_ai_column_def = dict(
+  owner = 'ai_column',
+  table_name = '__all_ai_column',
+  table_id = '12565',
+  table_type = 'VIRTUAL_TABLE',
+  gm_columns = [],
+  rowkey_columns = [
+    ('table_id', 'int'),
+    ('column_id', 'int')
+  ],
+  normal_columns = [
+    ('column_name', 'varchar:OB_MAX_COLUMN_NAME_LENGTH'),
+    ('max_retries', 'int'),
+    ('state_column_id', 'int'),
+    ('request_column_id', 'int'),
+    ('result_spec_column_id', 'int'),
+    ('normalized_expr', 'varchar:OB_MAX_VARCHAR_LENGTH')
+  ]
+)
+def_table_schema(**all_ai_column_def)
+
+
+# 12566: __all_ai_column_task
+all_ai_column_task_def = dict(
+  owner = 'ai_column',
+  table_name = '__all_ai_column_task',
+  table_id = '12566',
+  table_type = 'VIRTUAL_TABLE',
+  gm_columns = [],
+  rowkey_columns = [
+    ('table_id', 'int'),
+    ('column_id', 'int'),
+    ('request_id', 'varchar:64')
+  ],
+  normal_columns = [
+    ('eligible_ts', 'timestamp'),
+    ('retry_count', 'int'),
+    ('task_status', 'varchar:16')
+  ]
+)
+def_table_schema(**all_ai_column_task_def)
+
 # Reserved position (placeholder before this line)
 # Placeholder suggestion for this section: Use actual table names for placeholders
 ################################################################################
