@@ -44,8 +44,6 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <sched.h>
-#include <omp.h>
-
 #ifndef SEEKDB_CUVS_GRAPH_DEGREE
 #define SEEKDB_CUVS_GRAPH_DEGREE 128
 #endif
@@ -86,8 +84,6 @@
  * machine should simply use every core it has (the clamp must never make a
  * modest box slower than it already is).
  */
-extern void kmp_set_defaults(char const *) __attribute__((weak));
-
 /* CPUs this process may actually run on. libomp sizes its default team from the
  * affinity mask (not from /proc/cpuinfo), so this is the number the clamp has to
  * beat: under `taskset -c 0-23` the mask says 24 even on a 128-core host. */
@@ -122,10 +118,7 @@ static void sk_tune_host_threads(void)
     snprintf(spec, sizeof(spec), "OMP_NUM_THREADS=%ld", n);
     setenv("OMP_NUM_THREADS", spec + 16, 1);
     setenv("OMP_DYNAMIC", "false", 1);
-    if (kmp_set_defaults != NULL) kmp_set_defaults(spec);
   }
-  omp_set_dynamic(0);
-  omp_set_num_threads((int)n);
   done = 1;
 }
 

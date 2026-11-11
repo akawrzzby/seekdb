@@ -24,7 +24,6 @@ mkdir -p "$(dirname "$OUTPUT")"
   -shared \
   -fPIC \
   -O2 \
-  -fopenmp \
   -D__HIP_PLATFORM_AMD__ \
   -I"$HIPVS_ROOT/include" \
   -I"$ROCM_ROOT/include" \
