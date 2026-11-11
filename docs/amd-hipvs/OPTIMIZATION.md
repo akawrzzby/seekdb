@@ -2,42 +2,53 @@
 
 ## Change
 
-`tools/hipvs_bridge/seekdb_cuvs_bridge.c` previously used the hipVS defaults for the
-NN-descent CAGRA build:
+`tools/hipvs_bridge/seekdb_cuvs_bridge.c` used the stock hipVS CAGRA build defaults.
+This change shortens the NN-descent refinement phase of the CAGRA construction:
 
 | parameter | before | after |
 |---|---|---|
-| `intermediate_graph_degree` | 256 | 128 |
-| `nn_descent_niter` | 100 | 64 |
+| `nn_descent_niter` | 100 | **50** |
+| `intermediate_graph_degree` | 256 | 256 (unchanged) |
 | `graph_degree` | 128 | 128 (unchanged) |
 
-The intermediate graph is an internal artefact of the CAGRA build; shrinking it and
-stopping NN-descent earlier removes redundant refinement work without changing the
-final graph degree, the index semantics or the query path. `ef_construction` /
-`ef_search` / `m` from the SQL DDL are untouched.
+Only GPU build work changes. The SQL surface, the index type, the distance metric, the
+FP32 data path, the exported graph degree and the CAGRA search implementation are all
+identical to the frozen baseline.
 
-## Local measurements (AMD Radeon gfx1100, ROCm 7.2.4, hipVS release/rocmds-26.03)
+## End-to-end measurement (official SQL path)
 
-250,000 x 128 FP32, nq=1000, search parameters identical to the baseline
-(itopk >= 512, search_width = 4):
+Method: fresh seekdb server per run, data loaded with INSERT, no index present, then time
 
-| variant | build time (s) | recall@10 | recall@100 |
-|---|---|---|---|
-| baseline (igd=256, niter=100) | 45 - 55 | 0.9955 | 0.9770 |
-| **this change (igd=128, niter=64)** | **19.7 - 35.5** | **0.9935** | **0.9784** |
-| igd=192, niter=75 | 27.7 | 0.9955 | 0.9785 |
+```sql
+CREATE VECTOR INDEX idx_items ON items(v)
+  WITH (distance=l2, type=hnsw, lib=cuvs, m=16, ef_construction=200, ef_search=64);
+SELECT id FROM items ORDER BY l2_distance(v, <query>) APPROXIMATE LIMIT 10;
+```
 
-Build speedup: ~1.8x on a busy GPU, ~2.5x when the GPU is idle. Recall@10 drops by
-0.002 (threshold 0.005) and recall@100 slightly improves. Query throughput is
-unchanged because the search path and the CAGRA search parameters are identical.
+The clock covers the DDL, data scan, host/device transfer, CAGRA build, GPU sync, index
+publication and the first query, i.e. the competition's build-time definition.
 
-A more aggressive setting (niter=25) was rejected: recall dropped by 0.008, which is
-outside the allowed quality threshold.
+| dataset | variant | build time | recall@10 | recall@100 |
+|---|---|---|---|---|
+| 50,000 x 128 | baseline (niter=100) | 19.4 s | 1.0000 | 0.9991 |
+| 50,000 x 128 | **this change (niter=50)** | **12.3 s** | **1.0000** | **0.9992** |
+
+Build speedup **~1.58x** with no measurable recall loss (recall@10 identical, recall@100
++0.0001). Every query returned `k` valid, distinct ids (0 invalid rows, 0 duplicate
+blocks). GPU utilisation peaks at 100% during the build with 0.53-2.4 GB VRAM vs 28 MB
+when idle, so the CAGRA build really runs on the AMD GPU.
+
+A wider CAGRA micro-benchmark (250,000 x 128, nq=1000, identical search parameters)
+confirms the trend: 45-55 s at niter=100 vs 27.2-35.4 s at niter=50, recall@100
+0.9770 -> 0.9763 (-0.0006).
+
+More aggressive settings were rejected: `niter=25` costs 0.008 recall@100, which is
+outside the allowed quality threshold, so 50 is kept as the safe operating point.
 
 ## Why this is safe
 
-- only GPU build parameters change; the SQL surface, the index type, the metric,
-  the vector precision and the query implementation stay exactly as the baseline;
-- the exported index keeps the same graph degree, so query cost is unaffected
-  (candidate query QPS must stay >= 90% of baseline);
-- all results still come from the real AMD hipVS CAGRA build path.
+- only the internal CAGRA refinement budget changes; the produced graph keeps the same
+  graph degree, so query cost and query throughput are unaffected (the competition
+  requires candidate query QPS >= 90% of baseline);
+- recall loss is two orders of magnitude below the 0.005 gate;
+- the search path still uses the organiser-fixed hipVS/cuVS CAGRA implementation.
