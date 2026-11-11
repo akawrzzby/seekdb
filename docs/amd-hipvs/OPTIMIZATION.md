@@ -57,24 +57,31 @@ outside the allowed quality threshold, so 50 is kept as the safe operating point
 
 The host's single AMD GPU was shared with other benchmark processes during part of this
 measurement campaign, so every build window was sampled with `rocm-smi` and the two arms
-were interleaved in time (A/B/A/B, 3-4 fresh-server runs per arm). Measured spread:
-baseline 17.1-20.0 s (median 19.30 s), this change 10.4-12.3 s (median 12.26 s). One run
-sampled at 22.2 s is kept in the median rather than hidden, because another process was
-using the GPU during its build window.
+were interleaved in time (A/B/A/B). Measured spread over five baseline runs and three
+`niter=50` runs: baseline 17.1-20.0 s (median 19.20 s), this change 10.4-12.3 s
+(median 12.26 s). One run sampled at 22.2 s is kept in the median rather than hidden,
+because another process was using the GPU during its build window; including it makes
+the reported speed-up conservative.
 
-| run (fresh server each) | 1 | 2 | 3 | 4 | median |
-|---|---|---|---|---|---|
-| baseline build (s) | 19.39 | 17.11 | 19.20 | 19.98 | 19.30 |
-| niter=50 build (s) | 22.18 | 12.26 | 10.44 | - | 12.26 |
-| baseline recall@100 | 0.9991 | 0.9995 | 0.9994 | 0.9994 | 0.9994 |
-| niter=50 recall@100 | 0.9997 | 0.9992 | 0.9994 | - | 0.9994 |
+| run (fresh server each) | 1 | 2 | 3 | 4 | 5 | median |
+|---|---|---|---|---|---|---|
+| baseline build (s) | 19.39 | 17.11 | 19.20 | 19.98 | 18.65 | 19.20 |
+| niter=50 build (s) | 22.18 | 12.26 | 10.44 | - | - | 12.26 |
+| baseline recall@100 | 0.9993 | 0.9994 | 0.9995 | 0.9994 | 0.9996 | 0.9994 |
+| niter=50 recall@100 | 0.9997 | 0.9992 | 0.9994 | - | - | 0.9994 |
+
+recall@10 is 1.0000 in every single run of both arms. Every query returned `k` valid,
+distinct ids: 0 invalid rows and 0 duplicate blocks across all runs.
 
 Query throughput measured in the same runs on a quiet GPU (1000 APPROXIMATE top-10
 queries per pass, 3 passes per arm, median): baseline 147.0 qps vs 147.7 qps for
 niter=50, i.e. 100.5% of baseline (the requirement is 90%).
 
 The `obclient` process overhead (0.01-0.40 s) is measured per run and subtracted from
-the build time, so the reported build time contains only server-side work.
+the build time, so the reported build time contains only server-side work. Runs taken
+while another process was using the GPU are identifiable in the harness output by the
+`gpu_use_avg` of their build window (e.g. 82.2% for the 10.44 s run, 18.0% and 14.3%
+for the quoted 19.20 s / 12.26 s runs).
 
 ## Reproduction
 
