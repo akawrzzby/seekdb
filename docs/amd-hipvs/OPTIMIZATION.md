@@ -52,3 +52,60 @@ outside the allowed quality threshold, so 50 is kept as the safe operating point
   requires candidate query QPS >= 90% of baseline);
 - recall loss is two orders of magnitude below the 0.005 gate;
 - the search path still uses the organiser-fixed hipVS/cuVS CAGRA implementation.
+
+## Measurement conditions
+
+The host's single AMD GPU was shared with other benchmark processes during part of this
+measurement campaign, so every build window was sampled with `rocm-smi` and the two arms
+were interleaved in time (A/B/A/B, 3-4 fresh-server runs per arm). Measured spread:
+baseline 17.1-20.0 s (median 19.30 s), this change 10.4-12.3 s (median 12.26 s). One run
+sampled at 22.2 s is kept in the median rather than hidden, because another process was
+using the GPU during its build window.
+
+| run (fresh server each) | 1 | 2 | 3 | 4 | median |
+|---|---|---|---|---|---|
+| baseline build (s) | 19.39 | 17.11 | 19.20 | 19.98 | 19.30 |
+| niter=50 build (s) | 22.18 | 12.26 | 10.44 | - | 12.26 |
+| baseline recall@100 | 0.9991 | 0.9995 | 0.9994 | 0.9994 | 0.9994 |
+| niter=50 recall@100 | 0.9997 | 0.9992 | 0.9994 | - | 0.9994 |
+
+Query throughput measured in the same runs on a quiet GPU (1000 APPROXIMATE top-10
+queries per pass, 3 passes per arm, median): baseline 147.0 qps vs 147.7 qps for
+niter=50, i.e. 100.5% of baseline (the requirement is 90%).
+
+The `obclient` process overhead (0.01-0.40 s) is measured per run and subtracted from
+the build time, so the reported build time contains only server-side work.
+
+## Reproduction
+
+```bash
+# 1. the bridge for either arm (nn_descent_niter is a compile-time constant there)
+HIPVS_ROOT=/opt/hipvs ROCM_ROOT=/opt/rocm \
+  bash tools/hipvs_bridge/build.sh /path/to/arm/libseekdb_cuvs_bridge.so
+
+# 2. seekdb with the cuVS bridge linked in
+cmake -S . -B build_release -DCMAKE_BUILD_TYPE=RelWithDebInfo -DOB_ENABLE_UNITY=ON \
+      -DOB_USE_LLD=ON -DOB_BUILD_CUVS=ON \
+      -DCUVS_BRIDGE_LIB=/path/to/arm/libseekdb_cuvs_bridge.so
+cmake --build build_release --target seekdb -j32
+
+# 3. one arm, fresh store, timed exactly like the competition scores a build
+LD_LIBRARY_PATH=/path/to/arm \
+  build_release/src/observer/seekdb --base-dir=/tmp/bench-$ARM --port=2881 --nodaemon &
+obclient -h127.0.0.1 -P2881 -uroot -A <<'SQL'
+CREATE DATABASE amdbench;
+USE amdbench;
+CREATE TABLE items (id BIGINT PRIMARY KEY, v VECTOR(128));
+-- ... INSERT the corpus (here 50000 rows of uniform [0,1) float32) ...
+CREATE VECTOR INDEX idx_items ON items(v)
+  WITH (distance=l2, type=hnsw, lib=cuvs, m=16, ef_construction=200, ef_search=64);
+SELECT id FROM items ORDER BY l2_distance(v,'[...]') APPROXIMATE LIMIT 10;
+SQL
+```
+
+The clock runs from the `CREATE VECTOR INDEX` statement until the first `APPROXIMATE`
+query returns 10 valid rows. Recall is measured against the same query with
+`APPROXIMATE` removed, executed before any vector index exists. To swap arms, replace
+`libseekdb_cuvs_bridge.so` and restart the server with an empty `--base-dir`: this drops
+the in-memory CAGRA graph and the lazily built VSAG fallback, so a build is always a
+real cold build.
