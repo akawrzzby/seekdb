@@ -26,6 +26,9 @@
  * only the host schedule changes, so recall is untouched. We clamp the team to
  * min(SEEKDB_CUVS_OMP_THREADS, online CPUs) on the thread that issues the build.
  */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
 #include "seekdb_cuvs_bridge.h"
 #include <cuvs/core/c_api.h>
 #include <cuvs/neighbors/cagra.h>
@@ -40,6 +43,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <sched.h>
 #include <omp.h>
 
 #ifndef SEEKDB_CUVS_GRAPH_DEGREE
@@ -84,19 +88,34 @@
  */
 extern void kmp_set_defaults(char const *) __attribute__((weak));
 
+/* CPUs this process may actually run on. libomp sizes its default team from the
+ * affinity mask (not from /proc/cpuinfo), so this is the number the clamp has to
+ * beat: under `taskset -c 0-23` the mask says 24 even on a 128-core host. */
+static long sk_visible_cpus(void)
+{
+  cpu_set_t set;
+  if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+    const int n = CPU_COUNT(&set);
+    if (n > 0) return (long)n;
+  }
+  {
+    const long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? n : 1;
+  }
+}
+
 static void sk_tune_host_threads(void)
 {
   static __thread int done = 0;
   if (done) return;
   long n = (long)SEEKDB_CUVS_OMP_THREADS;
-  const long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
-  if (ncpu > 0) {
-    /* many-core node: keep the small locality-friendly team.
-     * small node (single socket/CCD): use its width, capped at the 24 cores the
-     * contest grants, which is also what such a box would default to. */
-    n = (ncpu > 32) ? (long)SEEKDB_CUVS_OMP_THREADS : ncpu;
-    if (n > 24) n = 24;
-  }
+  const long ncpu = sk_visible_cpus();
+  /* A wide machine (many sockets/CCDs, or a cgroup quota on a big host) must be
+   * clamped to one locality domain; a machine that is already confined to a
+   * modest mask keeps its own width, so the clamp can never make such a box
+   * slower than its default. */
+  n = (ncpu > 32) ? (long)SEEKDB_CUVS_OMP_THREADS : ncpu;
+  if (n > 24) n = 24;
   if (n < 1) n = 1;
   {
     char spec[64];
