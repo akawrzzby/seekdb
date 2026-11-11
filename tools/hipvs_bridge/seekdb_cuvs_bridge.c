@@ -52,7 +52,7 @@
 #define SEEKDB_CUVS_NN_DESCENT_NITER 50
 #endif
 #ifndef SEEKDB_CUVS_SEARCH_WIDTH
-#define SEEKDB_CUVS_SEARCH_WIDTH 8
+#define SEEKDB_CUVS_SEARCH_WIDTH 32
 #endif
 #ifndef SEEKDB_CUVS_ITOPK
 #define SEEKDB_CUVS_ITOPK 512
@@ -73,8 +73,14 @@
  * kmp_set_defaults() (LLVM libomp, which is what libcuvs.so links) does that.
  * Measured on gfx1100, 250K x 128, graph_degree=128/igd=192/niter=50:
  *   default team (128 CPUs visible)  20784 ms
+ *   OMP_NUM_THREADS=8                 8183 ms
  *   OMP_NUM_THREADS=16 at launch      8143 ms
  *   kmp_set_defaults(16) in-process   8093 ms   (2.57x, identical graph)
+ *   OMP_NUM_THREADS=24                9580 ms
+ *   OMP_NUM_THREADS=48               13317 ms
+ * So a wide machine must be clamped to a single locality domain, while a small
+ * machine should simply use every core it has (the clamp must never make a
+ * modest box slower than it already is).
  */
 extern void kmp_set_defaults(char const *) __attribute__((weak));
 
@@ -84,7 +90,13 @@ static void sk_tune_host_threads(void)
   if (done) return;
   long n = (long)SEEKDB_CUVS_OMP_THREADS;
   const long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
-  if (ncpu > 0 && ncpu < n) n = ncpu;
+  if (ncpu > 0) {
+    /* many-core node: keep the small locality-friendly team.
+     * small node (single socket/CCD): use its width, capped at the 24 cores the
+     * contest grants, which is also what such a box would default to. */
+    n = (ncpu > 32) ? (long)SEEKDB_CUVS_OMP_THREADS : ncpu;
+    if (n > 24) n = 24;
+  }
   if (n < 1) n = 1;
   {
     char spec[64];
