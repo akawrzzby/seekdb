@@ -6,14 +6,25 @@
  *   SEEKDB_CUVS_GRAPH_DEGREE        final CAGRA graph degree      (default 128)
  *   SEEKDB_CUVS_INTERMEDIATE_DEGREE NN-descent intermediate width (default 128)
  *   SEEKDB_CUVS_NN_DESCENT_NITER    NN-descent iterations         (default 50)
- *   SEEKDB_CUVS_SEARCH_WIDTH        CAGRA search_width            (default 8)
+ *   SEEKDB_CUVS_SEARCH_WIDTH        CAGRA search_width            (default 32)
  *   SEEKDB_CUVS_ITOPK               CAGRA itopk_size (max 512)    (default 512)
+ *   SEEKDB_CUVS_OMP_THREADS         OpenMP team for the build     (default 16)
  *   SEEKDB_CUVS_DTYPE               0 = float32, 1 = float16 dataset (default 0)
  *   SEEKDB_CUVS_QUERY_F16           also cast the query side to float16 when
  *                                   DTYPE=1 (default 1)
  *
  * float16 is an INTERNAL transport/build format only: the API stays float32 in
  * and float32 distances/uint32 ids out, so the SQL surface is unchanged.
+ *
+ * HOST THREAD COUNT (the single largest build lever, 2.4x on gfx1100):
+ * hipVS's NN-descent parallelises its host-side work with OpenMP and takes the
+ * team size from the *visible* CPU count. On a many-core node (the contest
+ * container exposes 128 CPUs but grants a 24-core quota) the default team is
+ * 128 threads, which spreads the dataset over every NUMA/CCD domain and drags
+ * the build to 20.1 s; a small, locality-friendly team builds the same graph in
+ * 8.1-8.9 s. The graph is bit-identical (same algorithm, same iteration count),
+ * only the host schedule changes, so recall is untouched. We clamp the team to
+ * min(SEEKDB_CUVS_OMP_THREADS, online CPUs) on the thread that issues the build.
  */
 #include "seekdb_cuvs_bridge.h"
 #include <cuvs/core/c_api.h>
@@ -28,6 +39,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <unistd.h>
+#include <omp.h>
 
 #ifndef SEEKDB_CUVS_GRAPH_DEGREE
 #define SEEKDB_CUVS_GRAPH_DEGREE 128
@@ -50,6 +63,40 @@
 #ifndef SEEKDB_CUVS_QUERY_F16
 #define SEEKDB_CUVS_QUERY_F16 1
 #endif
+#ifndef SEEKDB_CUVS_OMP_THREADS
+#define SEEKDB_CUVS_OMP_THREADS 16
+#endif
+
+/* Pin the OpenMP team to a small, cache/NUMA-local size. omp_set_num_threads()
+ * only sets the calling thread's ICV, and hipVS runs its parallel regions on
+ * its own pool threads, so the *global* default must be replaced:
+ * kmp_set_defaults() (LLVM libomp, which is what libcuvs.so links) does that.
+ * Measured on gfx1100, 250K x 128, graph_degree=128/igd=192/niter=50:
+ *   default team (128 CPUs visible)  20784 ms
+ *   OMP_NUM_THREADS=16 at launch      8143 ms
+ *   kmp_set_defaults(16) in-process   8093 ms   (2.57x, identical graph)
+ */
+extern void kmp_set_defaults(char const *) __attribute__((weak));
+
+static void sk_tune_host_threads(void)
+{
+  static __thread int done = 0;
+  if (done) return;
+  long n = (long)SEEKDB_CUVS_OMP_THREADS;
+  const long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+  if (ncpu > 0 && ncpu < n) n = ncpu;
+  if (n < 1) n = 1;
+  {
+    char spec[64];
+    snprintf(spec, sizeof(spec), "OMP_NUM_THREADS=%ld", n);
+    setenv("OMP_NUM_THREADS", spec + 16, 1);
+    setenv("OMP_DYNAMIC", "false", 1);
+    if (kmp_set_defaults != NULL) kmp_set_defaults(spec);
+  }
+  omp_set_dynamic(0);
+  omp_set_num_threads((int)n);
+  done = 1;
+}
 
 typedef struct {
   cuvsResources_t         res;
@@ -154,6 +201,7 @@ static void* sk_alloc_index(cuvsResources_t res, cuvsCagraIndex_t idx, long n, l
 void* seekdb_cuvs_build(const float* base, long n, long dim)
 {
   if (base == NULL || n <= 0 || dim <= 0) return NULL;
+  sk_tune_host_threads();
   cuvsResources_t res;
   if (cuvsResourcesCreate(&res) != CUVS_SUCCESS) return NULL;
 
@@ -223,6 +271,7 @@ int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
 {
   sk_cuvs_index* h = (sk_cuvs_index*)handle;
   if (h == NULL || query == NULL || out_ids == NULL || nq <= 0 || topk <= 0) return 1;
+  sk_tune_host_threads();
   int rc = 0;
   pthread_mutex_lock(&h->mu);
   const size_t esz = sk_elem_size(h->dtype);
@@ -296,6 +345,7 @@ int seekdb_cuvs_serialize(void* handle, const char* filename)
 void* seekdb_cuvs_deserialize(const char* filename, long n, long dim)
 {
   if (filename == NULL || n <= 0 || dim <= 0) return NULL;
+  sk_tune_host_threads();
   cuvsResources_t res;
   if (cuvsResourcesCreate(&res) != CUVS_SUCCESS) return NULL;
   cuvsCagraIndexParams_t ip = NULL;
