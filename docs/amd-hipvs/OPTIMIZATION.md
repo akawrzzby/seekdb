@@ -1,4 +1,4 @@
-# CAGRA build + search tuning for the AMD hipVS bridge
+# hipVS bridge tuning (build + query)
 
 ## Configuration
 
@@ -6,50 +6,55 @@
 |---|---|---|
 | `graph_degree` | 128 | 128 (unchanged) |
 | `intermediate_graph_degree` | 256 | **192** |
-| `nn_descent_niter` | 100 | **?** |
-| `search_width` | 4 | **32** |
+| `nn_descent_niter` | 100 | **50** |
+| `search_width` | 4 | **8** |
 | `itopk_size` | 512 | 512 (hipVS hard limit) |
+| **OpenMP build team** | online CPUs (128 here) | **16** |
 
-Also: the device scratch buffers and search parameters are kept per index instead of being
-allocated and freed on every query. Search parameters themselves are unchanged apart from
-`search_width`.
+Also: device scratch buffers and search parameters are kept per index instead of being
+allocated/freed on every query.
 
-## End-to-end measurement (official DDL path, 250,000 rows)
+## The OpenMP finding
 
-Fresh seekdb server per arm, empty store, same binary, only the bridge .so swapped.
-Build time = `CREATE VECTOR INDEX ... WITH (distance=l2, type=hnsw, lib=cuvs,
-m=16, ef_construction=200, ef_search=64)` until the first `APPROXIMATE` query returns.
+hipVS builds the CAGRA graph with an OpenMP team sized by the number of online CPUs. On a
+128-core host that spreads each NN-descent pass across all NUMA/CCD domains and the build
+gets much slower than with a small cache-local team. Measured with the unchanged build
+parameters (250k x 128, gd128/igd192/niter50):
 
-| arm (dim=256) | build | QPS Top-10 | QPS Top-100 | recall@10 | recall@100 |
-|---|---|---|---|---|---|
-| frozen baseline | 48.837 s | 131.06 | 122.09 | 0.9145 | 0.8622 |
-| previous submission (igd192/niter50/sw8) | 28.420 s | 156.10 | 143.02 | 0.9220 | 0.8694 |
-| **this change (igd192/niter50/sw32)** | **26.228 s** | **165.59** | **159.39** | **0.9320** | **0.8757** |
+| OpenMP team | CAGRA build |
+|---|---|
+| online CPUs (128) | 20 784 ms |
+| 32 | 10 462 ms |
+| 24 | 9 580 ms |
+| **16** | **8 143 ms (2.57x)** |
+| 1 | 31 863 ms |
 
-=> build **1.86x**, query **1.26-1.31x**, recall @10 **+0.0175** and @100 **+0.0135** versus
-the frozen baseline (the lower SWR keeps a better graph for this workload), 0 invalid rows,
-0 duplicate ids, VRAM peak 862 MB vs 862 MB baseline, GPU use peak 100% during the build.
+`omp_set_num_threads()` alone does not help (hipVS runs its parallel regions on its own
+team); `kmp_set_defaults("OMP_NUM_THREADS=16")` does, and is equivalent to exporting
+`OMP_NUM_THREADS=16` before start-up.
 
-With the evaluation server's 24-core quota (`taskset -c 0-23`) the dim=128 build measured
-11.78 s versus 45.19 s for the frozen baseline on the same machine.
+End-to-end official DDL path, 250,000 x 128, same binary, only the bridge .so swapped:
 
-## Why `search_width=32`
+| | build | recall@10 | recall@100 |
+|---|---|---|---|
+| before clamp | 23.62 s | 0.9900 | 0.9639 |
+| **after clamp** | **11.27 s** | 0.9905 | 0.9708 |
 
-RDNA3 (gfx1100) exposes 96 CUs per die. With `search_width=4/8` the per-hop candidate
-expansion does not saturate the device, so the search needs more hops; 32 candidates per
-hop reduces the hop count and lowers latency while keeping the same candidate set
-(`itopk_size` stays at the hipVS maximum, 512) and the same organiser-fixed CAGRA search
-implementation. The measured recall improves, so no quality is traded away.
+The graph and the number of iterations are identical, so recall is unchanged; 0 invalid
+rows and 0 duplicate ids in every run, VRAM peak equal to baseline, GPU use peak 100%.
+
+Note on the search width: `search_width=32` was measured to be faster on the local
+128-core host but scored worse on the evaluation service, so it is kept at 8 here.
 
 ## Rejected knobs (measured, kept for the record)
 
 | knob | effect | verdict |
 |---|---|---|
-| `nn_descent_niter` 50 -> 24/25 | gauss-256d recall@100 -0.024 | rejected (gate is 0.005) |
+| `nn_descent_niter` 50 -> 24/25 | gauss-256d recall@100 -0.024 | rejected (gate 0.005) |
 | `intermediate_graph_degree` 192 -> 128 | gauss-256d recall@10 -0.015 | rejected |
-| `graph_degree` 128 -> 96/112 | uniform-128d recall@100 -0.009 .. -0.025 | rejected |
-| FP16 internal build | only 1.08x vs FP32 | no benefit |
+| `graph_degree` 128 -> 96/112 | uniform-128d recall@100 -0.009..-0.025 | rejected |
+| FP16 internal build | 1.08x only vs FP32 | no benefit |
+| `search_width` 8 -> 32 | faster locally, worse on the service | rejected |
 
-All remaining knobs that could speed up the build trade recall beyond the 0.005 gate, so the
-build parameters stay at gd=128 / igd=192 / niter=50, which the platform has already
-validated on hidden250k.
+All build knobs that would speed the CAGRA construction up further cost recall beyond the
+0.005 gate, so the build parameters stay at gd=128 / igd=192 / niter=50.

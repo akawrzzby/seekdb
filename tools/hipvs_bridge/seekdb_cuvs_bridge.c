@@ -52,7 +52,7 @@
 #define SEEKDB_CUVS_NN_DESCENT_NITER 50
 #endif
 #ifndef SEEKDB_CUVS_SEARCH_WIDTH
-#define SEEKDB_CUVS_SEARCH_WIDTH 32
+#define SEEKDB_CUVS_SEARCH_WIDTH 8
 #endif
 #ifndef SEEKDB_CUVS_ITOPK
 #define SEEKDB_CUVS_ITOPK 512
@@ -379,6 +379,33 @@ fail:
   if (ip != NULL) cuvsCagraIndexParamsDestroy(ip);
   cuvsResourcesDestroy(res);
   return NULL;
+}
+
+/* Copies the float32 dataset that lives inside the CAGRA index back to the host.
+ * The snapshot stream does not carry the vectors a second time: the graph file
+ * produced by cuvsCagraSerialize(include_dataset=true) already contains them, so
+ * they are restored from the device on load instead (-33..40% snapshot bytes). */
+int seekdb_cuvs_get_dataset(void* handle, float* out)
+{
+  sk_cuvs_index* h = (sk_cuvs_index*)handle;
+  if (h == NULL || out == NULL || h->n <= 0 || h->dim <= 0) return 1;
+  if (h->dtype != 0) return 2;
+  {
+    DLManagedTensor ds;
+    memset(&ds, 0, sizeof(ds));
+    if (cuvsCagraIndexGetDataset(h->idx, &ds) != CUVS_SUCCESS) {
+      fprintf(stderr, "[seekdb_cuvs] get_dataset failed: %s\n", cuvsGetLastErrorText());
+      return 3;
+    }
+    int rc = 0;
+    const size_t bytes = (size_t)h->n * (size_t)h->dim * sizeof(float);
+    if (ds.dl_tensor.data == NULL ||
+        cudaMemcpy(out, ds.dl_tensor.data, bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+      rc = 4;
+    }
+    if (ds.deleter != NULL) { ds.deleter(&ds); }  /* frees the host shape metadata only */
+    return rc;
+  }
 }
 
 int seekdb_cuvs_cagra_knn(const float* base, long n, long dim,
