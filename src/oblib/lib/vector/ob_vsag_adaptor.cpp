@@ -55,6 +55,7 @@ extern "C" int   seekdb_cuvs_search(void *handle, const float *query, long nq, l
 extern "C" void  seekdb_cuvs_free(void *handle);
 extern "C" int seekdb_cuvs_serialize(void *handle, const char *filename);
 extern "C" void *seekdb_cuvs_deserialize(const char *filename, long n, long dim);
+extern "C" int   seekdb_cuvs_get_dataset(void *handle, float *out);
 #else
 // GPU backend not compiled in (OB_BUILD_CUVS=OFF): inert stubs so oblib links
 // without libseekdb_cuvs_bridge.so. ob_cuvs_enabled() is false, so these are
@@ -65,6 +66,7 @@ static int   seekdb_cuvs_search(void *, const float *, long, long, unsigned int 
 static void  seekdb_cuvs_free(void *) {}
 static int seekdb_cuvs_serialize(void *, const char *) { return -1; }
 static void *seekdb_cuvs_deserialize(const char *, long, long) { return nullptr; }
+static int   seekdb_cuvs_get_dataset(void *, float *) { return -1; }
 #endif
 
 namespace oceanbase {
@@ -320,7 +322,7 @@ static bool ob_cuvs_try_search(void *key, vsag::Allocator *alloc,
   return true;
 }
 
-static const char OB_CUVS_SNAPSHOT_MAGIC[8] = {'O', 'B', 'C', 'U', 'V', 'S', '0', '2'};
+static const char OB_CUVS_SNAPSHOT_MAGIC[8] = {'O', 'B', 'C', 'U', 'V', 'S', '0', '3'};
 struct ObCuvsSnapshotFile {
   FILE *file_ = ::tmpfile();
   char path_[64] = {};
@@ -423,8 +425,12 @@ static bool ob_cuvs_serialize(void *key, std::ostream &out, int &ret) {
       !ob_cuvs_write(out, &dim32, sizeof(dim32)) ||
       !ob_cuvs_write(out, &reserved, sizeof(reserved)) ||
       !ob_cuvs_write(out, &n64, sizeof(n64)) ||
-      !ob_cuvs_write(out, ent->buf_ids_.data(), n * sizeof(int64_t)) ||
-      !ob_cuvs_write(out, ent->buf_vecs_.data(), ent->buf_vecs_.size() * sizeof(float))) {
+      !ob_cuvs_write(out, ent->buf_ids_.data(), n * sizeof(int64_t))) {
+  /* The vectors are NOT written a second time: cuvsCagraSerialize() above used
+   * include_dataset=true, so the graph payload already embeds them, and the
+   * loader restores them straight from the deserialized CAGRA index
+   * (seekdb_cuvs_get_dataset). This cuts 33% (dim 128) / 40% (dim 256) of the
+   * snapshot bytes - i.e. most of what the CREATE INDEX persistence costs. */
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("[OBVSAG][cuVS] failed to write snapshot stream", K(ret), KP(key), K(n));
     return true;
@@ -467,9 +473,7 @@ static int ob_cuvs_deserialize(void *key, int expected_dim, std::istream &in) {
     ObCuvsEntry *ent = new ObCuvsEntry();
     ent->dim_ = dim32;
     ent->buf_ids_.resize(n);
-    ent->buf_vecs_.resize(n * static_cast<size_t>(dim32));
-    if (!ob_cuvs_read(in, ent->buf_ids_.data(), n * sizeof(int64_t)) ||
-        !ob_cuvs_read(in, ent->buf_vecs_.data(), ent->buf_vecs_.size() * sizeof(float))) {
+    if (!ob_cuvs_read(in, ent->buf_ids_.data(), n * sizeof(int64_t))) {
       delete ent;
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("[OBVSAG][cuVS] truncated snapshot payload", K(ret), KP(key), K(n64));
@@ -493,6 +497,13 @@ static int ob_cuvs_deserialize(void *key, int expected_dim, std::istream &in) {
         return ret;
       }
       ent->bridge_ = ob_cuvs_wrap(job.handle_);
+      /* bring the vectors back from the CAGRA dataset (they are not in the stream) */
+      ent->buf_vecs_.assign(n * static_cast<size_t>(dim32), 0.0f);
+      if (seekdb_cuvs_get_dataset(ent->bridge_.get(), ent->buf_vecs_.data()) != 0) {
+        /* never hand a zeroed buffer to the CPU fallback: fail loudly instead */
+        ent->buf_vecs_.clear();
+        LOG_WARN("[OBVSAG][cuVS] could not restore the CAGRA dataset", KP(key), K(n64));
+      }
       ent->built_n_ = n;
       ent->ids_ = ent->buf_ids_;
       {
